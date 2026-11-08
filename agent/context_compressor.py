@@ -1955,6 +1955,7 @@ _TOOL_RESULT_SUMMARIZERS = {
         _sum_browser,
     ),
     "web_search": _sum_template("[web_search] query='{query}' ({content_len:,} chars result)", query="?"),
+    "web_search_markdown": _sum_template("[web_search_markdown] query='{query}' ({content_len:,} chars result)", query="?"),
     "web_extract": _sum_web_extract,
     "delegate_task": _sum_delegate_task,
     "execute_code": _sum_execute_code,

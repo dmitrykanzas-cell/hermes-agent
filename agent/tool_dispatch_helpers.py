@@ -41,6 +41,7 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "vision_analyze",
     "web_extract",
     "web_search",
+    "web_search_markdown",
 })
 
 # Filesystem tools admitted by path overlap: readers may share a subtree, a writer conflicts

@@ -347,6 +347,80 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return _finish_debug("web_search_tool", debug_call_data, f"Error searching web: {e!s}")
 
 
+async def web_search_markdown_tool(
+    query: str,
+    search_limit: int = 5,
+    extract_limit: int = 3,
+    char_limit: Optional[int] = None,
+) -> str:
+    """Search, then extract the top results as clean Markdown.
+
+    Search and extraction remain separate internally so each keeps its own
+    provider and safety checks. A failed page is reported per result rather
+    than discarding the other pages.
+    """
+    if not isinstance(query, str) or not query.strip():
+        return tool_error("A non-empty search query is required", success=False)
+    try:
+        search_limit = min(max(int(search_limit), 1), 10)
+    except (TypeError, ValueError):
+        search_limit = 5
+    try:
+        extract_limit = min(max(int(extract_limit), 1), min(search_limit, 5))
+    except (TypeError, ValueError):
+        extract_limit = min(3, search_limit)
+
+    try:
+        search_data = json.loads(web_search_tool(query.strip(), limit=search_limit))
+    except (TypeError, json.JSONDecodeError) as exc:
+        return tool_error(f"Search returned invalid data: {exc}", success=False)
+    if not search_data.get("success"):
+        return json.dumps(search_data, indent=2, ensure_ascii=False)
+
+    hits = search_data.get("data", {}).get("web", [])
+    selected = [hit for hit in hits[:extract_limit] if isinstance(hit, dict) and hit.get("url")]
+    if not selected:
+        return json.dumps({"success": True, "query": query.strip(), "results": []}, indent=2, ensure_ascii=False)
+
+    extract_data = json.loads(await web_extract_tool(
+        [hit["url"] for hit in selected],
+        "markdown",
+        char_limit=char_limit,
+    ))
+    extracted_by_url = {
+        item.get("url"): item
+        for item in extract_data.get("results", [])
+        if isinstance(item, dict) and item.get("url")
+    }
+    results = []
+    for rank, hit in enumerate(selected, start=1):
+        page = extracted_by_url.get(hit["url"], {})
+        result = {
+            "rank": hit.get("position", rank),
+            "title": hit.get("title", ""),
+            "url": hit["url"],
+            "snippet": hit.get("description", ""),
+            "extractor": "hermes-web-extract",
+        }
+        if page.get("error"):
+            result["status"] = "error"
+            result["error"] = page["error"]
+        else:
+            result["status"] = "ok"
+            result["content_markdown"] = page.get("content", "")
+            if page.get("title") and not result["title"]:
+                result["title"] = page["title"]
+        results.append(result)
+
+    return json.dumps({
+        "success": True,
+        "query": query.strip(),
+        "search_provider": search_data.get("data", {}).get("served_by"),
+        "search_backend_error": search_data.get("data", {}).get("backend_error"),
+        "results": results,
+    }, indent=2, ensure_ascii=False)
+
+
 def _memoized_search(provider, query: str, limit: int) -> dict:
     """TTL memo + single-flight around the paid vendor call (tools/web_result_cache.py); sits after every
     safety/config check. The provider is asked for the BUCKETED count so near-identical limits share an entry;
@@ -548,11 +622,45 @@ WEB_EXTRACT_SCHEMA = {
             },
             "char_limit": {
                 "type": "integer",
-                "description": "Optional per-page character budget sent back (default 15000). Pages larger than this are head+tail truncated with the full text stored to disk. Raise it when you need more of a long page inline.",
+                "description": "Optional per-page character budget sent back (default 15000). Pages larger than this are head+tail truncated with the full text stored to disk.",
                 "minimum": 2000
             }
         },
         "required": ["urls"]
+    }
+}
+
+WEB_SEARCH_MARKDOWN_SCHEMA = {
+    "name": "web_search_markdown",
+    "description": "Search the web and extract the top results as clean Markdown. Uses the configured search backend and Hermes web extraction; returns per-page status, source URL, snippet, and Markdown content.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Non-empty web search query."
+            },
+            "search_limit": {
+                "type": "integer",
+                "description": "Maximum search results to consider (1-10). Defaults to 5.",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 5
+            },
+            "extract_limit": {
+                "type": "integer",
+                "description": "Maximum top results to extract as Markdown (1-5). Defaults to 3.",
+                "minimum": 1,
+                "maximum": 5,
+                "default": 3
+            },
+            "char_limit": {
+                "type": "integer",
+                "description": "Optional per-page character budget for extracted Markdown.",
+                "minimum": 2000
+            }
+        },
+        "required": ["query"]
     }
 }
 
@@ -569,5 +677,16 @@ registry.register(
         char_limit=args.get("char_limit"),
     ),
     check_fn=check_web_api_key, requires_env=_web_requires_env(), is_async=True, emoji="📄",
+    max_result_size_chars=100_000,
+)
+registry.register(
+    name="web_search_markdown", toolset="web", schema=WEB_SEARCH_MARKDOWN_SCHEMA,
+    handler=lambda args, **kw: web_search_markdown_tool(
+        args.get("query", ""),
+        search_limit=args.get("search_limit", 5),
+        extract_limit=args.get("extract_limit", 3),
+        char_limit=args.get("char_limit"),
+    ),
+    check_fn=check_web_api_key, requires_env=_web_requires_env(), is_async=True, emoji="📝",
     max_result_size_chars=100_000,
 )
