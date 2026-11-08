@@ -9,6 +9,7 @@ caching, keyless rescue, and the truncate-and-store result pipeline.
 Debug: ``WEB_TOOLS_DEBUG=true`` writes ``logs/web_tools_debug_<UUID>.json``.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -371,27 +372,41 @@ async def web_search_markdown_tool(
         extract_limit = min(3, search_limit)
 
     try:
-        search_data = json.loads(web_search_tool(query.strip(), limit=search_limit))
+        # Provider search() is sync; run it off the event loop (contextvars, incl. interrupt scope, are copied).
+        search_raw = await asyncio.to_thread(web_search_tool, query.strip(), search_limit)
+        search_data = json.loads(search_raw)
     except (TypeError, json.JSONDecodeError) as exc:
         return tool_error(f"Search returned invalid data: {exc}", success=False)
-    if not search_data.get("success"):
+    if not isinstance(search_data, dict) or not search_data.get("success"):
         return json.dumps(search_data, indent=2, ensure_ascii=False)
 
-    hits = search_data.get("data", {}).get("web", [])
+    search_meta = search_data.get("data", {})
+    hits = search_meta.get("web", [])
     selected = [hit for hit in hits[:extract_limit] if isinstance(hit, dict) and hit.get("url")]
-    if not selected:
-        return json.dumps({"success": True, "query": query.strip(), "results": []}, indent=2, ensure_ascii=False)
-
-    extract_data = json.loads(await web_extract_tool(
-        [hit["url"] for hit in selected],
-        "markdown",
-        char_limit=char_limit,
-    ))
-    extracted_by_url = {
-        item.get("url"): item
-        for item in extract_data.get("results", [])
-        if isinstance(item, dict) and item.get("url")
+    # served_by is set only when a fallback vendor answered; otherwise the configured backend did.
+    search_provider = search_meta.get("served_by") or _get_search_backend() or None
+    envelope = {
+        "success": True,
+        "query": query.strip(),
+        "search_provider": search_provider,
+        "search_backend_error": search_meta.get("backend_error"),
     }
+    if not selected:
+        return json.dumps({**envelope, "results": []}, indent=2, ensure_ascii=False)
+
+    # Extract with the normal budget, clean, then apply the caller's budget to the cleaned text. Passing a small
+    # char_limit to web_extract would spend it on page chrome (head+tail cut) before cleaning could remove it.
+    extract_error = None
+    extracted_by_url = {}
+    try:
+        extract_data = json.loads(await web_extract_tool([hit["url"] for hit in selected], "markdown"))
+        extract_error = extract_data.get("error") if isinstance(extract_data, dict) else "invalid extract response"
+        for item in (extract_data.get("results", []) if isinstance(extract_data, dict) else []):
+            if isinstance(item, dict) and item.get("url"):
+                extracted_by_url[item["url"]] = item
+    except Exception as exc:  # one failed batch must not discard the search hits
+        extract_error = f"Extraction failed: {exc}"
+
     results = []
     for rank, hit in enumerate(selected, start=1):
         page = extracted_by_url.get(hit["url"], {})
@@ -402,23 +417,46 @@ async def web_search_markdown_tool(
             "snippet": hit.get("description", ""),
             "extractor": "hermes-web-extract",
         }
-        if page.get("error"):
+        if page.get("error") or not page:
             result["status"] = "error"
-            result["error"] = page["error"]
+            result["error"] = page.get("error") or extract_error or "No extraction result for this URL"
         else:
+            content, truncated = _clean_markdown(page.get("content", ""), char_limit)
             result["status"] = "ok"
-            result["content_markdown"] = page.get("content", "")
+            result["content_markdown"] = content
+            result["truncated"] = truncated
             if page.get("title") and not result["title"]:
                 result["title"] = page["title"]
         results.append(result)
 
-    return json.dumps({
-        "success": True,
-        "query": query.strip(),
-        "search_provider": search_data.get("data", {}).get("served_by"),
-        "search_backend_error": search_data.get("data", {}).get("backend_error"),
-        "results": results,
-    }, indent=2, ensure_ascii=False)
+    return json.dumps({**envelope, "results": results}, indent=2, ensure_ascii=False)
+
+
+_MARKDOWN_FOOTER_HEADINGS = ("## Was this helpful", "## Need more help", "## Related", "## Share this")
+_MARKDOWN_TRUNCATION_MARK = "\n\n[... truncated by web_search_markdown ...]"
+
+
+def _clean_markdown(text: str, char_limit: Optional[int] = None) -> tuple[str, bool]:
+    """Drop page chrome before the first H1 and feedback/footer sections, then cap at *char_limit* (head only).
+
+    Pure text transform; returns (markdown, truncated). Pages without an H1 keep their full head.
+    """
+    if not isinstance(text, str):
+        return "", False
+    lines = text.split("\n")
+    for i, line in enumerate(lines[:80]):
+        if line.startswith("# "):
+            lines = lines[i:]
+            break
+    for i, line in enumerate(lines):
+        if line.strip().startswith(_MARKDOWN_FOOTER_HEADINGS):
+            lines = lines[:i]
+            break
+    cleaned = "\n".join(lines).strip()
+    limit = _effective_char_limit(char_limit) if char_limit else 8000
+    if len(cleaned) > limit:
+        return cleaned[:limit].rstrip() + _MARKDOWN_TRUNCATION_MARK, True
+    return cleaned, False
 
 
 def _memoized_search(provider, query: str, limit: int) -> dict:
@@ -622,7 +660,7 @@ WEB_EXTRACT_SCHEMA = {
             },
             "char_limit": {
                 "type": "integer",
-                "description": "Optional per-page character budget sent back (default 15000). Pages larger than this are head+tail truncated with the full text stored to disk.",
+                "description": "Optional per-page character budget sent back (default 15000). Pages larger than this are head+tail truncated with the full text stored to disk. Raise it when you need more of a long page inline.",
                 "minimum": 2000
             }
         },

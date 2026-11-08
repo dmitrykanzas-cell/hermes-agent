@@ -82,6 +82,16 @@ The result has this shape:
 }
 ```
 
+Behaviour details:
+
+- `search_provider` is `web.search_backend` unless a fallback vendor answered
+  (`served_by`), in which case the fallback name is reported.
+- Pages are extracted with the normal budget, then page chrome before the first
+  H1 and feedback/footer sections are removed, and only then `char_limit` is
+  applied (head only, default 8000). Each result carries `truncated`.
+- Search runs in `asyncio.to_thread`, so it does not block the event loop.
+- A failed extract batch keeps the search hits and marks each as `status: error`.
+
 A page-level extraction failure is returned as one result with
 `"status": "error"`; other pages are preserved.
 
