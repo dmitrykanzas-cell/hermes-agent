@@ -9,6 +9,7 @@ caching, keyless rescue, and the truncate-and-store result pipeline.
 Debug: ``WEB_TOOLS_DEBUG=true`` writes ``logs/web_tools_debug_<UUID>.json``.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -347,6 +348,117 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         return _finish_debug("web_search_tool", debug_call_data, f"Error searching web: {e!s}")
 
 
+async def web_search_markdown_tool(
+    query: str,
+    search_limit: int = 5,
+    extract_limit: int = 3,
+    char_limit: Optional[int] = None,
+) -> str:
+    """Search, then extract the top results as clean Markdown.
+
+    Search and extraction remain separate internally so each keeps its own
+    provider and safety checks. A failed page is reported per result rather
+    than discarding the other pages.
+    """
+    if not isinstance(query, str) or not query.strip():
+        return tool_error("A non-empty search query is required", success=False)
+    try:
+        search_limit = min(max(int(search_limit), 1), 10)
+    except (TypeError, ValueError):
+        search_limit = 5
+    try:
+        extract_limit = min(max(int(extract_limit), 1), min(search_limit, 5))
+    except (TypeError, ValueError):
+        extract_limit = min(3, search_limit)
+
+    try:
+        # Provider search() is sync; run it off the event loop (contextvars, incl. interrupt scope, are copied).
+        search_raw = await asyncio.to_thread(web_search_tool, query.strip(), search_limit)
+        search_data = json.loads(search_raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        return tool_error(f"Search returned invalid data: {exc}", success=False)
+    if not isinstance(search_data, dict) or not search_data.get("success"):
+        return json.dumps(search_data, indent=2, ensure_ascii=False)
+
+    search_meta = search_data.get("data", {})
+    hits = search_meta.get("web", [])
+    selected = [hit for hit in hits[:extract_limit] if isinstance(hit, dict) and hit.get("url")]
+    # served_by is set only when a fallback vendor answered; otherwise the configured backend did.
+    search_provider = search_meta.get("served_by") or _get_search_backend() or None
+    envelope = {
+        "success": True,
+        "query": query.strip(),
+        "search_provider": search_provider,
+        "search_backend_error": search_meta.get("backend_error"),
+    }
+    if not selected:
+        return json.dumps({**envelope, "results": []}, indent=2, ensure_ascii=False)
+
+    # Extract with the normal budget, clean, then apply the caller's budget to the cleaned text. Passing a small
+    # char_limit to web_extract would spend it on page chrome (head+tail cut) before cleaning could remove it.
+    extract_error = None
+    extracted_by_url = {}
+    try:
+        extract_data = json.loads(await web_extract_tool([hit["url"] for hit in selected], "markdown"))
+        extract_error = extract_data.get("error") if isinstance(extract_data, dict) else "invalid extract response"
+        for item in (extract_data.get("results", []) if isinstance(extract_data, dict) else []):
+            if isinstance(item, dict) and item.get("url"):
+                extracted_by_url[item["url"]] = item
+    except Exception as exc:  # one failed batch must not discard the search hits
+        extract_error = f"Extraction failed: {exc}"
+
+    results = []
+    for rank, hit in enumerate(selected, start=1):
+        page = extracted_by_url.get(hit["url"], {})
+        result = {
+            "rank": hit.get("position", rank),
+            "title": hit.get("title", ""),
+            "url": hit["url"],
+            "snippet": hit.get("description", ""),
+            "extractor": "hermes-web-extract",
+        }
+        if page.get("error") or not page:
+            result["status"] = "error"
+            result["error"] = page.get("error") or extract_error or "No extraction result for this URL"
+        else:
+            content, truncated = _clean_markdown(page.get("content", ""), char_limit)
+            result["status"] = "ok"
+            result["content_markdown"] = content
+            result["truncated"] = truncated
+            if page.get("title") and not result["title"]:
+                result["title"] = page["title"]
+        results.append(result)
+
+    return json.dumps({**envelope, "results": results}, indent=2, ensure_ascii=False)
+
+
+_MARKDOWN_FOOTER_HEADINGS = ("## Was this helpful", "## Need more help", "## Related", "## Share this")
+_MARKDOWN_TRUNCATION_MARK = "\n\n[... truncated by web_search_markdown ...]"
+
+
+def _clean_markdown(text: str, char_limit: Optional[int] = None) -> tuple[str, bool]:
+    """Drop page chrome before the first H1 and feedback/footer sections, then cap at *char_limit* (head only).
+
+    Pure text transform; returns (markdown, truncated). Pages without an H1 keep their full head.
+    """
+    if not isinstance(text, str):
+        return "", False
+    lines = text.split("\n")
+    for i, line in enumerate(lines[:80]):
+        if line.startswith("# "):
+            lines = lines[i:]
+            break
+    for i, line in enumerate(lines):
+        if line.strip().startswith(_MARKDOWN_FOOTER_HEADINGS):
+            lines = lines[:i]
+            break
+    cleaned = "\n".join(lines).strip()
+    limit = _effective_char_limit(char_limit) if char_limit else 8000
+    if len(cleaned) > limit:
+        return cleaned[:limit].rstrip() + _MARKDOWN_TRUNCATION_MARK, True
+    return cleaned, False
+
+
 def _memoized_search(provider, query: str, limit: int) -> dict:
     """TTL memo + single-flight around the paid vendor call (tools/web_result_cache.py); sits after every
     safety/config check. The provider is asked for the BUCKETED count so near-identical limits share an entry;
@@ -556,6 +668,40 @@ WEB_EXTRACT_SCHEMA = {
     }
 }
 
+WEB_SEARCH_MARKDOWN_SCHEMA = {
+    "name": "web_search_markdown",
+    "description": "Search the web and extract the top results as clean Markdown. Uses the configured search backend and Hermes web extraction; returns per-page status, source URL, snippet, and Markdown content.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Non-empty web search query."
+            },
+            "search_limit": {
+                "type": "integer",
+                "description": "Maximum search results to consider (1-10). Defaults to 5.",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 5
+            },
+            "extract_limit": {
+                "type": "integer",
+                "description": "Maximum top results to extract as Markdown (1-5). Defaults to 3.",
+                "minimum": 1,
+                "maximum": 5,
+                "default": 3
+            },
+            "char_limit": {
+                "type": "integer",
+                "description": "Optional per-page character budget for extracted Markdown.",
+                "minimum": 2000
+            }
+        },
+        "required": ["query"]
+    }
+}
+
 registry.register(
     name="web_search", toolset="web", schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
@@ -569,5 +715,16 @@ registry.register(
         char_limit=args.get("char_limit"),
     ),
     check_fn=check_web_api_key, requires_env=_web_requires_env(), is_async=True, emoji="📄",
+    max_result_size_chars=100_000,
+)
+registry.register(
+    name="web_search_markdown", toolset="web", schema=WEB_SEARCH_MARKDOWN_SCHEMA,
+    handler=lambda args, **kw: web_search_markdown_tool(
+        args.get("query", ""),
+        search_limit=args.get("search_limit", 5),
+        extract_limit=args.get("extract_limit", 3),
+        char_limit=args.get("char_limit"),
+    ),
+    check_fn=check_web_api_key, requires_env=_web_requires_env(), is_async=True, emoji="📝",
     max_result_size_chars=100_000,
 )
